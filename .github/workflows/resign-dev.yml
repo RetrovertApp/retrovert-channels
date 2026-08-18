@@ -1,0 +1,93 @@
+name: Re-sign dev channel
+
+# A channel expires whether or not anyone publishes to it: timestamp 14 days
+# after each signature, snapshot and targets 60. Twice weekly leaves three
+# missed runs of slack before the shortest of those lapses — and once it has
+# lapsed the job cannot recover the channel on its own, because `pull` refuses
+# metadata that no longer verifies.
+on:
+  schedule:
+    - cron: '17 5 * * 1,4'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Two re-signs racing would both read the same versions and publish the same
+# names with different bytes.
+concurrency:
+  group: resign-dev
+  cancel-in-progress: false
+
+env:
+  CHANNEL: dev
+  CHANNEL_REPO: RetrovertApp/playback_plugins
+
+jobs:
+  resign:
+    runs-on: ubuntu-latest
+    # Holds the channel's online keys and the credential that writes to its
+    # host. The root key is not here and takes no part in a re-sign.
+    environment: channel-signing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The signer is built from this repository, at the revision this workflow
+      # is running from, against a committed lockfile — so the binary handed the
+      # channel's private keys is the one reviewed alongside the anchor it uses.
+      - run: cargo build --release --locked --bin retrovert-publish
+
+      - name: Assemble a workspace holding only the online keys
+        env:
+          TARGETS_KEY: ${{ secrets.CHANNEL_TARGETS_KEY }}
+          SNAPSHOT_KEY: ${{ secrets.CHANNEL_SNAPSHOT_KEY }}
+          TIMESTAMP_KEY: ${{ secrets.CHANNEL_TIMESTAMP_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p workspace/keys/online workspace/repository/metadata
+
+          write_key() {
+            # An absent secret arrives as an empty variable rather than an
+            # error, and a one-byte PEM would otherwise get through the pull and
+            # only fail at the signing step — after a network round trip, with a
+            # parse error for a cause. Fail here instead, where the reason is
+            # legible.
+            if [ -z "$2" ]; then
+              echo "::error::the $1 key secret is empty or unset in this environment"
+              exit 1
+            fi
+            # Command substitution strips trailing newlines, so each PEM ends
+            # with exactly one however the secret was pasted in.
+            printf '%s\n' "$(printf '%s' "$2")" > "workspace/keys/online/$1.pem"
+          }
+          write_key targets   "$TARGETS_KEY"
+          write_key snapshot  "$SNAPSHOT_KEY"
+          write_key timestamp "$TIMESTAMP_KEY"
+
+          # The channel's trust anchor comes from this repository, reviewed and
+          # committed — never from the host being re-signed.
+          cp "$CHANNEL/root.json" workspace/repository/metadata/root.json
+
+      - name: Take the chain the channel currently serves
+        run: |
+          ./target/release/retrovert-publish pull workspace \
+            --repo "$CHANNEL_REPO" --channel "$CHANNEL"
+
+      - name: Re-sign it and publish the refreshed metadata
+        env:
+          GH_TOKEN: ${{ secrets.CHANNEL_TOKEN }}
+        run: |
+          ./target/release/retrovert-publish resign workspace \
+            --repo "$CHANNEL_REPO" --channel "$CHANNEL"
+
+      - name: Read the channel back as a client does
+        run: |
+          ./target/release/retrovert-publish verify \
+            "https://github.com/$CHANNEL_REPO/releases/download/$CHANNEL/channel-metadata/" \
+            "$CHANNEL/root.json"
+
+      - name: Discard the keys
+        if: always()
+        run: rm -rf workspace/keys

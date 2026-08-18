@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = ["crates/retrovert-publish"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/RetrovertApp/retrovert-channels"
+
+[workspace.dependencies]
+# The metadata model is shared with the client updater, which is the crate's
+# widely-consumed side; it lives there and is pinned here by revision. Bumping
+# this is what adopts a metadata format change on the publisher side, so it is
+# deliberate and reviewed rather than a floating branch reference.
+retrovert-tuf = { git = "https://github.com/RetrovertApp/retrovert-updater", rev = "0ef7a7fb776887a380e77f77527f12ef77455ed7" }
+
+clap = { version = "4.6", features = ["derive"] }
+jiff = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+ureq = "3.4"
+zeroize = "1.8"
+
+pollster = "1.0"
+sigstore-tuf = { version = "0.11", default-features = false }
+tempfile = "3"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+# Every fallible function here fails for the reason its signature implies; a
+# boilerplate `# Errors` section per function would be noise, not documentation.
+missing_errors_doc = "allow"
