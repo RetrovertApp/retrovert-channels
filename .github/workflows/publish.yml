@@ -83,7 +83,8 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          mkdir -p workspace/keys/online workspace/repository/metadata
+          # Unlike a re-sign, a publish also writes the manifest target.
+          mkdir -p workspace/keys/online workspace/repository/metadata workspace/repository/targets
 
           write_key() {
             if [ -z "$2" ]; then
