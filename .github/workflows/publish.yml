@@ -1,0 +1,179 @@
+name: Publish channel release
+# The manifest digest in the title lets the dispatching gather identify its
+# run among concurrent dispatches.
+run-name: Publish ${{ inputs.channel }}/v${{ inputs.version }} (${{ inputs.manifest_sha256 }})
+
+# The signing half of the publication transaction. The gather in the channel
+# host repository stages the release set's artifacts and manifest on the
+# `<channel>/vN` release, then dispatches this workflow, which alone holds
+# the online keys. Publishing the TUF metadata — timestamp last — is the
+# atomic commit point of the whole transaction: until it lands, clients
+# resolve the previous generation and the staged assets are unreferenced.
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Channel to publish to
+        required: true
+      version:
+        description: Release-set number N of the <channel>/vN tag
+        required: true
+      manifest_sha256:
+        description: SHA-256 the gathered manifest must hash to
+        required: true
+      stop_after:
+        description: Failed-publish drill; stop after this many uploads
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+# One writer per channel version sequence: a publish racing the re-sign job
+# would read the same versions and publish the same names with different
+# bytes.
+concurrency:
+  group: sign-${{ inputs.channel }}
+  cancel-in-progress: false
+
+env:
+  CHANNEL: ${{ inputs.channel }}
+  VERSION: ${{ inputs.version }}
+  MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+  STOP_AFTER: ${{ inputs.stop_after }}
+  CHANNEL_REPO: RetrovertApp/playback_plugins
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Holds the channel's online keys and the credential that writes to its
+    # host. The root key is not here and takes no part in a publish.
+    environment: channel-signing
+    steps:
+      - name: Check the request
+        run: |
+          if [[ ! "$CHANNEL" =~ ^[a-z][a-z0-9-]*$ ]] || [[ ! "$VERSION" =~ ^[0-9]+$ ]] \
+            || [[ ! "$MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] || [[ ! "$STOP_AFTER" =~ ^[0-9]*$ ]]; then
+            echo "::error::malformed dispatch inputs"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Check the channel exists here
+        run: |
+          if [ ! -f "$CHANNEL/root.json" ]; then
+            echo "::error::no trust anchor for channel '$CHANNEL' in this repository"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The signer is built from this repository, at the revision this workflow
+      # is running from, against a committed lockfile — so the binary handed the
+      # channel's private keys is the one reviewed alongside the anchor it uses.
+      - run: cargo build --release --locked --bin retrovert-publish
+
+      - name: Assemble a workspace holding only the online keys
+        env:
+          TARGETS_KEY: ${{ secrets.CHANNEL_TARGETS_KEY }}
+          SNAPSHOT_KEY: ${{ secrets.CHANNEL_SNAPSHOT_KEY }}
+          TIMESTAMP_KEY: ${{ secrets.CHANNEL_TIMESTAMP_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p workspace/keys/online workspace/repository/metadata
+
+          write_key() {
+            if [ -z "$2" ]; then
+              echo "::error::the $1 key secret is empty or unset in this environment"
+              exit 1
+            fi
+            printf '%s\n' "$(printf '%s' "$2")" > "workspace/keys/online/$1.pem"
+          }
+          write_key targets   "$TARGETS_KEY"
+          write_key snapshot  "$SNAPSHOT_KEY"
+          write_key timestamp "$TIMESTAMP_KEY"
+
+          # The channel's trust anchor comes from this repository, reviewed and
+          # committed — never from the host being published to.
+          cp "$CHANNEL/root.json" workspace/repository/metadata/root.json
+
+      # Pull before publishing: the re-sign job also writes this channel's
+      # version sequence, so a workspace built from anything but the live
+      # chain would publish different bytes over names the host already
+      # serves.
+      - name: Take the chain the channel currently serves
+        run: |
+          ./target/release/retrovert-publish pull workspace \
+            --repo "$CHANNEL_REPO" --channel "$CHANNEL"
+
+      - name: Refuse to publish backwards
+        run: |
+          current=$(./target/release/retrovert-publish verify \
+            "https://github.com/$CHANNEL_REPO/releases/download/$CHANNEL/channel-metadata/" \
+            "$CHANNEL/root.json" | grep -oP '^release:\s+v\K[0-9]+')
+          echo "channel serves v$current, publishing v$VERSION"
+          if [ "$VERSION" -le "$current" ]; then
+            echo "::error::release-set v$VERSION is not newer than the published v$current"
+            exit 1
+          fi
+
+      - name: Fetch the gathered manifest from the release set
+        run: |
+          url="https://github.com/$CHANNEL_REPO/releases/download/$CHANNEL/v$VERSION/manifest.json"
+          # GitHub's edge cache can serve a freshly-uploaded name stale for a
+          # few minutes; the digest pin turns that into retry-until-fresh.
+          for attempt in $(seq 1 20); do
+            if curl -fsSL -o manifest.json "$url?t=$(date +%s%N)"; then
+              got=$(sha256sum manifest.json | cut -d' ' -f1)
+              if [ "$got" = "$MANIFEST_SHA256" ]; then break; fi
+              echo "attempt $attempt: manifest hashes to $got, want $MANIFEST_SHA256"
+            else
+              echo "attempt $attempt: manifest not resolvable yet"
+            fi
+            got=""
+            sleep 15
+          done
+          if [ "${got:-}" != "$MANIFEST_SHA256" ]; then
+            echo "::error::gathered manifest never matched the dispatched digest"
+            exit 1
+          fi
+          manifest_version=$(jq -r '.version' manifest.json)
+          if [ "$manifest_version" != "$VERSION" ]; then
+            echo "::error::manifest says version $manifest_version, dispatch says $VERSION"
+            exit 1
+          fi
+
+      - name: Publish the metadata, timestamp last
+        env:
+          GH_TOKEN: ${{ secrets.CHANNEL_TOKEN }}
+        run: |
+          stop_after_flag=""
+          if [ -n "$STOP_AFTER" ]; then stop_after_flag="--stop-after $STOP_AFTER"; fi
+          ./target/release/retrovert-publish publish workspace manifest.json \
+            --repo "$CHANNEL_REPO" --channel "$CHANNEL" $stop_after_flag
+
+      # The metadata is already committed at this point; a stale edge-cache
+      # read must not turn into a false failure, so retry before concluding
+      # anything.
+      - name: Read the channel back as a client does
+        run: |
+          published=""
+          for attempt in $(seq 1 8); do
+            published=$(./target/release/retrovert-publish verify \
+              "https://github.com/$CHANNEL_REPO/releases/download/$CHANNEL/channel-metadata/" \
+              "$CHANNEL/root.json" | tee /dev/stderr | grep -oP '^release:\s+v\K[0-9]+' || true)
+            if [ "$published" = "$VERSION" ]; then break; fi
+            echo "attempt $attempt: channel resolves v${published:-nothing}, want v$VERSION"
+            sleep 20
+          done
+          if [ "$published" != "$VERSION" ]; then
+            echo "::error::channel does not read back as v$VERSION; the metadata commit may still have landed — inspect the channel before re-dispatching"
+            exit 1
+          fi
+
+      - name: Discard the keys
+        if: always()
+        run: rm -rf workspace/keys

@@ -13,10 +13,11 @@ on:
 permissions:
   contents: read
 
-# Two re-signs racing would both read the same versions and publish the same
-# names with different bytes.
+# Two signers racing — this job against itself, or against a publish —
+# would both read the same versions and publish the same names with
+# different bytes. The publish workflow shares this group.
 concurrency:
-  group: resign-dev
+  group: sign-dev
   cancel-in-progress: false
 
 env:
